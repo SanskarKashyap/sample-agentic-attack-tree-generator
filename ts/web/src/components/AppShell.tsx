@@ -17,6 +17,7 @@ import BreadcrumbGroup from '@cloudscape-design/components/breadcrumb-group';
 import type { AppLayoutProps } from '@cloudscape-design/components/app-layout';
 import type { SideNavigationProps } from '@cloudscape-design/components/side-navigation';
 import type { BreadcrumbGroupProps } from '@cloudscape-design/components/breadcrumb-group';
+import { syncStoredApiKeys } from '@/utils/apiKeyStore';
 
 const NAV_ITEMS: ReadonlyArray<SideNavigationProps.Item> = [
   { type: 'link', text: 'Home', href: '/' },
@@ -62,6 +63,14 @@ export default function AppShell({
   // the initial client tree match the server, eliminating the mismatch.
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
+
+  // Every page renders this shell, so this is where API keys cached in the
+  // browser get re-sent to the server, which only holds them in memory and
+  // forgets them on restart. Runs then find the key whichever page started them.
+  useEffect(() => {
+    void syncStoredApiKeys();
+  }, []);
+
   if (!mounted) {
     return <div suppressHydrationWarning />;
   }

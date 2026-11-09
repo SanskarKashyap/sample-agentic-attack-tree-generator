@@ -44,8 +44,26 @@ import {
   getLangfuseConfig,
   saveLangfuseConfig,
   testLangfuseConnection,
+  setApiKey as sendApiKeyToServer,
+  getApiKeyStatus,
+  getProviderModels,
 } from '@/api/client';
-import type { BedrockModel } from '@threatforest/types';
+import { getStoredApiKey, setStoredApiKey, deleteStoredApiKey } from '@/utils/apiKeyStore';
+import type {
+  ApiKeyStatusResponse,
+  BedrockModel,
+  ProviderModel,
+  ProviderModelsResponse,
+} from '@threatforest/types';
+
+// Providers authenticated by an API key (rather than AWS credentials).
+const API_KEY_PROVIDERS = new Set(['Anthropic', 'OpenAI', 'Google Gemini']);
+
+const API_KEY_PLACEHOLDER: Record<string, string> = {
+  Anthropic: 'sk-ant-api03-...',
+  OpenAI: 'sk-...',
+  'Google Gemini': 'AIza...',
+};
 
 interface ModelOption {
   label: string;
@@ -107,6 +125,14 @@ export default function ConfigurePage() {
   const [langfuseHost, setLangfuseHost] = useState('https://cloud.langfuse.com');
   const [savingLangfuse, setSavingLangfuse] = useState(false);
   const [testingLangfuse, setTestingLangfuse] = useState(false);
+  // API key for the selected provider, as typed or as loaded from IndexedDB.
+  const [apiKey, setApiKeyValue] = useState('');
+  const [apiKeyStored, setApiKeyStored] = useState(false);
+  const [apiKeyStatus, setApiKeyStatus] = useState<ApiKeyStatusResponse | null>(null);
+  // Models the provider says this key can call; null until a key is validated.
+  const [liveModels, setLiveModels] = useState<ProviderModel[] | null>(null);
+  const [liveModelsError, setLiveModelsError] = useState<string | null>(null);
+  const [loadingLiveModels, setLoadingLiveModels] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -216,14 +242,114 @@ export default function ConfigurePage() {
     };
   }, [isBedrock, awsRegion]);
 
+  // Load the selected provider's cached key and the server's key status
+  // whenever the provider changes.
+  const providerName = modelProvider?.value ?? '';
+  const needsApiKey = API_KEY_PROVIDERS.has(providerName);
+
+  const refreshApiKeyStatus = async (provider: string) => {
+    try {
+      setApiKeyStatus(await getApiKeyStatus(provider));
+    } catch {
+      setApiKeyStatus(null);
+    }
+  };
+
+  /**
+   * Ask the provider which models this key can call and fill the Model ID list
+   * with them. Doubles as the key check: a bad key fails here. `key` null means
+   * "use the key the server already holds".
+   */
+  const fetchLiveModels = async (
+    provider: string,
+    key: string | null,
+  ): Promise<ProviderModelsResponse> => {
+    setLoadingLiveModels(true);
+    try {
+      const result = await getProviderModels(provider, key);
+      setLiveModels(result.success ? result.models : null);
+      setLiveModelsError(result.success ? null : result.message);
+      return result;
+    } catch (err) {
+      const message = (err as Error).message || 'Could not load models.';
+      setLiveModels(null);
+      setLiveModelsError(message);
+      return { success: false, message, models: [] };
+    } finally {
+      setLoadingLiveModels(false);
+    }
+  };
+
+  useEffect(() => {
+    setLiveModels(null);
+    setLiveModelsError(null);
+    if (!needsApiKey) {
+      setApiKeyValue('');
+      setApiKeyStored(false);
+      setApiKeyStatus(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const stored = await getStoredApiKey(providerName);
+      if (cancelled) return;
+      setApiKeyValue(stored ?? '');
+      setApiKeyStored(Boolean(stored));
+      let status: ApiKeyStatusResponse | null = null;
+      try {
+        status = await getApiKeyStatus(providerName);
+      } catch {
+        // server unreachable; the page load error flash already covers it
+      }
+      if (cancelled) return;
+      setApiKeyStatus(status);
+      // A key is already known, so the live model list can load right away.
+      if (stored || status?.configured) await fetchLiveModels(providerName, stored);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // fetchLiveModels only touches state setters, so it is safe to omit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [providerName, needsApiKey]);
+
+  /** Cache the typed key in IndexedDB and hand it to the server's memory. */
+  const persistApiKey = async (): Promise<void> => {
+    const key = apiKey.trim();
+    if (!needsApiKey || !key) return;
+    const stored = await setStoredApiKey(providerName, key);
+    setApiKeyStored(stored);
+    if (!stored) {
+      addFlash(
+        'warning',
+        'This browser blocked local storage, so the API key will be forgotten when the server restarts.',
+        'api-key-storage',
+      );
+    }
+    await sendApiKeyToServer(providerName, key);
+    await refreshApiKeyStatus(providerName);
+  };
+
+  const handleForgetApiKey = async () => {
+    await deleteStoredApiKey(providerName);
+    try {
+      await sendApiKeyToServer(providerName, null);
+    } catch {
+      // server unreachable: it will not get the key again from this browser anyway
+    }
+    setApiKeyValue('');
+    setApiKeyStored(false);
+    await refreshApiKeyStatus(providerName);
+    addFlash('info', `${providerName} API key removed from this browser.`, 'api-key-forget');
+  };
+
   const buildTestConfig = () => ({
     provider: modelProvider?.value || '',
     model_id: modelId,
     aws_profile: awsProfile || null,
     aws_region: awsRegion || null,
-    // The connection-test contract expects an explicit api_key; this UI has no
-    // api-key field for the model provider, so send null (as before).
-    api_key: null,
+    // Empty → the server falls back to the key it already holds, if any.
+    api_key: needsApiKey ? apiKey.trim() || null : null,
   });
 
   const buildSaveConfig = () => ({
@@ -245,27 +371,57 @@ export default function ConfigurePage() {
     ]);
   };
 
+  const markVerified = () => {
+    try {
+      const signature = JSON.stringify({
+        provider: modelProvider?.value || '',
+        model_id: modelId,
+        aws_profile: awsProfile || '',
+      });
+      window.localStorage.setItem('threatforest.configVerified', signature);
+    } catch {
+      // localStorage unavailable — non-fatal
+    }
+  };
+
+  // API-key providers: validate the key by listing its models, fill the Model
+  // ID list from that, then say whether the chosen model is among them. No
+  // model has to be picked first, since the list is what you pick from.
+  const testApiKeyProvider = async () => {
+    const result = await fetchLiveModels(providerName, apiKey.trim() || null);
+    if (!result.success) {
+      addFlash('error', result.message, 'test-result');
+      return;
+    }
+    await persistApiKey();
+    if (!modelId) {
+      addFlash('success', `${result.message} Choose a model from the Model ID list.`, 'test-result');
+    } else if (result.models.some((m) => m.id === modelId)) {
+      addFlash('success', `${result.message} ${modelId} is ready to use.`, 'test-result');
+      markVerified();
+    } else {
+      addFlash(
+        'warning',
+        `${result.message} "${modelId}" is not one of them. Pick a model from the Model ID list, then save.`,
+        'test-result',
+      );
+    }
+  };
+
   const handleTestConnection = async () => {
     setTestingConnection(true);
     try {
+      if (needsApiKey) {
+        await testApiKeyProvider();
+        return;
+      }
       const result = await testConnection(buildTestConfig());
       addFlash(
         result.success ? 'success' : 'error',
         result.message || (result.success ? 'Connection successful.' : 'Connection failed.'),
         'test-result',
       );
-      if (result.success) {
-        try {
-          const signature = JSON.stringify({
-            provider: modelProvider?.value || '',
-            model_id: modelId,
-            aws_profile: awsProfile || '',
-          });
-          window.localStorage.setItem('threatforest.configVerified', signature);
-        } catch {
-          // localStorage unavailable — non-fatal
-        }
-      }
+      if (result.success) markVerified();
     } catch (err) {
       addFlash('error', (err as Error).message || 'Connection test failed.', 'test-result');
     } finally {
@@ -277,6 +433,7 @@ export default function ConfigurePage() {
     setSaving(true);
     try {
       const result = await saveConfig(buildSaveConfig());
+      if (result.success) await persistApiKey();
       addFlash(
         result.success ? 'success' : 'error',
         result.message || (result.success ? 'Configuration saved.' : 'Save failed.'),
@@ -352,7 +509,26 @@ export default function ConfigurePage() {
     );
   }
 
-  const providerModels = modelProvider ? PROVIDER_MODELS[modelProvider.value ?? ''] || [] : [];
+  // For API-key providers, the models the provider listed for this key win.
+  // The hardcoded list is only a fallback until a key has been validated.
+  const usingLiveModels = needsApiKey && liveModels !== null && liveModels.length > 0;
+  const providerModels: SelectProps.Option[] = usingLiveModels
+    ? liveModels.map((m) => ({
+        label: m.label,
+        value: m.id,
+        ...(m.label !== m.id ? { description: m.id } : {}),
+      }))
+    : modelProvider
+      ? PROVIDER_MODELS[modelProvider.value ?? ''] || []
+      : [];
+  // Keep a saved model visible even when the current list does not contain it.
+  const selectedModelOption: SelectProps.Option | null = !modelId
+    ? null
+    : (providerModels.find((o) => o.value === modelId) ??
+      modelIdOption ?? { label: modelId, value: modelId });
+  const refreshLiveModels = () => {
+    void fetchLiveModels(providerName, apiKey.trim() || null);
+  };
 
   // Bedrock options, grouped so the models this pipeline is tuned for surface
   // first. Non-recommended providers (Qwen, Mistral, DeepSeek, ...) are hidden
@@ -418,6 +594,33 @@ export default function ConfigurePage() {
     return null;
   })();
 
+  // Same idea for API-key providers: say where the list came from, and warn
+  // when the chosen model is not one the key can call.
+  const keyModelFieldStatus = ((): { type: 'warning' | 'info'; text: string } | null => {
+    if (!needsApiKey) return null;
+    if (loadingLiveModels) return { type: 'info', text: `Loading models from ${providerName}…` };
+    if (liveModelsError) {
+      return { type: 'warning', text: `Could not load models: ${liveModelsError}` };
+    }
+    if (liveModels === null) {
+      return {
+        type: 'info',
+        text: 'Enter your API key below and click Test Connection to load the models it can use.',
+      };
+    }
+    if (modelId && !liveModels.some((m) => m.id === modelId)) {
+      return {
+        type: 'warning',
+        text: `"${modelId}" is not available for this API key. Choose another model.`,
+      };
+    }
+    return {
+      type: 'info',
+      text: `${liveModels.length} models available for your API key.`,
+    };
+  })();
+  const modelFieldStatus = isBedrock ? bedrockFieldStatus : keyModelFieldStatus;
+
   return (
     <AppShell
       activePage="/configure"
@@ -446,7 +649,7 @@ export default function ConfigurePage() {
                 <Button
                   onClick={handleTestConnection}
                   loading={testingConnection}
-                  disabled={!modelProvider?.value || !modelId}
+                  disabled={!modelProvider?.value || (!needsApiKey && !modelId)}
                   iconName="status-positive"
                 >
                   Test Connection
@@ -485,11 +688,11 @@ export default function ConfigurePage() {
                           ? 'Type to search the live Bedrock catalogue, or enter any model id directly.'
                           : undefined
                       }
-                      {...(bedrockFieldStatus?.type === 'warning'
-                        ? { warningText: bedrockFieldStatus.text }
+                      {...(modelFieldStatus?.type === 'warning'
+                        ? { warningText: modelFieldStatus.text }
                         : {})}
-                      {...(bedrockFieldStatus?.type === 'info'
-                        ? { constraintText: bedrockFieldStatus.text }
+                      {...(modelFieldStatus?.type === 'info'
+                        ? { constraintText: modelFieldStatus.text }
                         : {})}
                       secondaryControl={
                         isBedrock ? (
@@ -512,6 +715,13 @@ export default function ConfigurePage() {
                                 .finally(() => setLoadingModels(false));
                             }}
                           />
+                        ) : needsApiKey && (apiKey.trim() || apiKeyStatus?.configured) ? (
+                          <Button
+                            iconName="refresh"
+                            loading={loadingLiveModels}
+                            ariaLabel={`Reload the ${providerName} model list`}
+                            onClick={refreshLiveModels}
+                          />
                         ) : undefined
                       }
                     >
@@ -531,7 +741,9 @@ export default function ConfigurePage() {
                         />
                       ) : modelProvider && providerModels.length > 0 ? (
                         <Select
-                          selectedOption={modelIdOption}
+                          selectedOption={selectedModelOption}
+                          statusType={loadingLiveModels ? 'loading' : 'finished'}
+                          loadingText="Loading models…"
                           onChange={({ detail }) => {
                             setModelIdOption(detail.selectedOption);
                             setModelId(detail.selectedOption.value ?? '');
@@ -560,6 +772,33 @@ export default function ConfigurePage() {
                       the pipeline&apos;s prompts are tuned for Claude
                     </Toggle>
                   )}
+                  {needsApiKey && (
+                    <FormField
+                      label={`${providerName} API key`}
+                      description="Saved only in this browser (IndexedDB) and sent to your local ThreatForest server, which keeps it in memory. It is never written to config.yaml."
+                      constraintText={
+                        apiKeyStored
+                          ? 'Saved in this browser.'
+                          : apiKeyStatus?.source === 'environment'
+                            ? `No key saved here. The server is using ${apiKeyStatus.env_var} from its environment.`
+                            : 'Paste a key, then click Test Connection or Save Configuration.'
+                      }
+                      secondaryControl={
+                        apiKeyStored ? (
+                          <Button onClick={handleForgetApiKey}>Forget key</Button>
+                        ) : undefined
+                      }
+                    >
+                      <Input
+                        value={apiKey}
+                        onChange={({ detail }) => setApiKeyValue(detail.value)}
+                        placeholder={API_KEY_PLACEHOLDER[providerName] ?? 'API key'}
+                        type="password"
+                        autoComplete={false}
+                      />
+                    </FormField>
+                  )}
+                  {isBedrock && (
                   <ColumnLayout columns={2}>
                     <FormField label="AWS Profile">
                       <Input
@@ -576,6 +815,7 @@ export default function ConfigurePage() {
                       />
                     </FormField>
                   </ColumnLayout>
+                  )}
                 </SpaceBetween>
               </Container>
             </SpaceBetween>

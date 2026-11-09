@@ -239,6 +239,42 @@ export const ConfigSaveRequestSchema = z.object({
 });
 export type ConfigSaveRequest = z.infer<typeof ConfigSaveRequestSchema>;
 
+/**
+ * POST /config/api-key — hand the server a provider API key held in the
+ * browser. The server keeps it in memory only (never on disk); `api_key: null`
+ * clears it and restores whatever the server was launched with.
+ */
+export const ApiKeySetRequestSchema = z.object({
+  provider: z.string(),
+  api_key: z.string().nullable().default(null),
+});
+export type ApiKeySetRequest = z.infer<typeof ApiKeySetRequestSchema>;
+
+/** GET /config/api-key-status — whether the server has a key, never the key itself. */
+export const ApiKeyStatusResponseSchema = z.object({
+  configured: z.boolean(),
+  source: z.enum(['browser', 'environment']).nullable(),
+  env_var: z.string().nullable(),
+});
+export type ApiKeyStatusResponse = z.infer<typeof ApiKeyStatusResponseSchema>;
+
+/** POST /config/provider-models — list models an API key can call (key optional). */
+export const ProviderModelsRequestSchema = z.object({
+  provider: z.string(),
+  api_key: z.string().nullable().default(null),
+});
+export type ProviderModelsRequest = z.infer<typeof ProviderModelsRequestSchema>;
+
+export const ProviderModelSchema = z.object({ id: z.string(), label: z.string() });
+export type ProviderModel = z.infer<typeof ProviderModelSchema>;
+
+export const ProviderModelsResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string(),
+  models: z.array(ProviderModelSchema),
+});
+export type ProviderModelsResponse = z.infer<typeof ProviderModelsResponseSchema>;
+
 export const LangfuseConfigResponseSchema = z.object({
   enabled: z.boolean().default(false),
   public_key: z.string().nullable().default(null),

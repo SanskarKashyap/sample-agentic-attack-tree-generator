@@ -25,9 +25,14 @@ import { dirname, join } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { config as engineConfig, FRAMEWORKS } from '@threatforest/engine';
 import {
+  ApiKeySetRequestSchema,
+  type ApiKeyStatusResponse,
   type ConfigResponse,
   ConfigSaveRequestSchema,
   ConfigTestRequestSchema,
+  type ProviderModel,
+  ProviderModelsRequestSchema,
+  type ProviderModelsResponse,
   type ProvidersResponse,
   LangfuseConfigSaveRequestSchema,
 } from '@threatforest/types';
@@ -46,6 +51,193 @@ const PROVIDER_TO_KEY: Record<string, string> = {
 const KEY_TO_PROVIDER: Record<string, string> = Object.fromEntries(
   Object.entries(PROVIDER_TO_KEY).map(([k, v]) => [v, k]),
 );
+
+// The env var each API-key provider's SDK reads its key from. Runs build their
+// models in this process, so setting the var here is all a run needs.
+const PROVIDER_ENV_VAR: Record<string, string> = {
+  Anthropic: 'ANTHROPIC_API_KEY',
+  OpenAI: 'OPENAI_API_KEY',
+  'Google Gemini': 'GEMINI_API_KEY',
+};
+
+// Values the server was launched with (e.g. from ~/.bashrc), so clearing a
+// browser-supplied key falls back to them instead of leaving no key at all.
+const LAUNCH_ENV: Record<string, string | undefined> = Object.fromEntries(
+  Object.values(PROVIDER_ENV_VAR).map((v) => [v, process.env[v]]),
+);
+
+// Env vars currently overridden by a key the browser sent. In memory only: a
+// browser-supplied key is never written to config.yaml or .env.
+const browserKeyVars = new Set<string>();
+
+const PROBE_TIMEOUT_MS = 15_000;
+
+async function readErrorDetail(response: globalThis.Response): Promise<string> {
+  try {
+    const body = (await response.json()) as { error?: { message?: string } | string };
+    const detail = typeof body.error === 'string' ? body.error : body.error?.message;
+    return (detail ?? '').slice(0, 300);
+  } catch {
+    return '';
+  }
+}
+
+const PROVIDER_API_BASE: Record<string, string> = {
+  Anthropic: 'https://api.anthropic.com/v1',
+  OpenAI: 'https://api.openai.com/v1',
+  'Google Gemini': 'https://generativelanguage.googleapis.com/v1beta',
+};
+
+function authHeaders(provider: string, apiKey: string): Record<string, string> {
+  switch (provider) {
+    case 'Anthropic':
+      return { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' };
+    case 'OpenAI':
+      return { Authorization: `Bearer ${apiKey}` };
+    default:
+      // Header, not the ?key= query param, so the key stays out of URLs/logs.
+      return { 'x-goog-api-key': apiKey };
+  }
+}
+
+type ProviderCall =
+  | { ok: true; body: unknown }
+  | { ok: false; status: number | null; message: string };
+
+/** GET a provider REST path with the key, turning every failure into a readable message. */
+async function callProvider(provider: string, path: string, apiKey: string): Promise<ProviderCall> {
+  const base = PROVIDER_API_BASE[provider];
+  if (!base) {
+    return { ok: false, status: null, message: `${provider} is not an API-key provider.` };
+  }
+  let response: globalThis.Response;
+  try {
+    response = await fetch(`${base}${path}`, {
+      headers: authHeaders(provider, apiKey),
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      status: null,
+      message: `Could not reach ${provider}: ${(err as Error).message}`,
+    };
+  }
+  if (response.ok) {
+    try {
+      return { ok: true, body: await response.json() };
+    } catch {
+      return { ok: false, status: response.status, message: `${provider} sent an unreadable reply.` };
+    }
+  }
+  const detail = await readErrorDetail(response);
+  const suffix = detail ? ` (${detail})` : '';
+  // Gemini answers a bad key with 400 "API key not valid" rather than 401.
+  const badKey =
+    response.status === 401 ||
+    response.status === 403 ||
+    (response.status === 400 && /api key/i.test(detail));
+  return {
+    ok: false,
+    status: response.status,
+    message: badKey
+      ? `${provider} rejected the API key${suffix}.`
+      : `${provider} returned HTTP ${response.status}${suffix}.`,
+  };
+}
+
+/**
+ * Check an API key against the provider by fetching the chosen model's
+ * metadata. That one cheap, token-free call proves both that the key
+ * authenticates and that the model id exists for it.
+ */
+async function probeProvider(
+  provider: string,
+  modelId: string,
+  apiKey: string,
+): Promise<{ success: boolean; message: string }> {
+  const result = await callProvider(provider, `/models/${encodeURIComponent(modelId)}`, apiKey);
+  if (result.ok) {
+    return {
+      success: true,
+      message: `Connected to ${provider}. The API key is valid and model ${modelId} is available.`,
+    };
+  }
+  if (result.status === 404) {
+    return {
+      success: false,
+      message: `The API key works, but ${provider} has no model "${modelId}". Pick another model.`,
+    };
+  }
+  return { success: false, message: result.message };
+}
+
+// Pagination guard: providers list well under this many pages today.
+const MAX_MODEL_PAGES = 10;
+
+// OpenAI's /models also lists audio, image, embedding and moderation models
+// the pipeline cannot drive as a chat agent; keep only chat-capable families.
+const OPENAI_CHAT_MODEL = /^(gpt-|o\d|chatgpt-)/;
+const OPENAI_NON_CHAT = /(audio|realtime|transcribe|tts|image|search|embedding|moderation|instruct)/;
+
+/** The models this key can call, newest first where the provider says when. */
+async function listProviderModels(
+  provider: string,
+  apiKey: string,
+): Promise<{ success: boolean; message: string; models: ProviderModel[] }> {
+  const models: ProviderModel[] = [];
+
+  if (provider === 'Anthropic') {
+    let afterId: string | null = null;
+    for (let page = 0; page < MAX_MODEL_PAGES; page += 1) {
+      const qs: string = afterId ? `&after_id=${encodeURIComponent(afterId)}` : '';
+      const result = await callProvider(provider, `/models?limit=1000${qs}`, apiKey);
+      if (!result.ok) return { success: false, message: result.message, models: [] };
+      const body = result.body as {
+        data?: { id: string; display_name?: string }[];
+        has_more?: boolean;
+        last_id?: string | null;
+      };
+      for (const m of body.data ?? []) models.push({ id: m.id, label: m.display_name || m.id });
+      if (!body.has_more || !body.last_id) break;
+      afterId = body.last_id;
+    }
+    // Anthropic already returns newest first.
+  } else if (provider === 'OpenAI') {
+    const result = await callProvider(provider, '/models', apiKey);
+    if (!result.ok) return { success: false, message: result.message, models: [] };
+    const data = ((result.body as { data?: { id: string; created?: number }[] }).data ?? [])
+      .filter((m) => OPENAI_CHAT_MODEL.test(m.id) && !OPENAI_NON_CHAT.test(m.id))
+      .sort((a, b) => (b.created ?? 0) - (a.created ?? 0));
+    for (const m of data) models.push({ id: m.id, label: m.id });
+  } else if (provider === 'Google Gemini') {
+    let pageToken: string | null = null;
+    for (let page = 0; page < MAX_MODEL_PAGES; page += 1) {
+      const qs: string = pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '';
+      const result = await callProvider(provider, `/models?pageSize=1000${qs}`, apiKey);
+      if (!result.ok) return { success: false, message: result.message, models: [] };
+      const body = result.body as {
+        models?: { name: string; displayName?: string; supportedGenerationMethods?: string[] }[];
+        nextPageToken?: string;
+      };
+      for (const m of body.models ?? []) {
+        if (!m.supportedGenerationMethods?.includes('generateContent')) continue;
+        const id = m.name.replace(/^models\//, '');
+        models.push({ id, label: m.displayName || id });
+      }
+      if (!body.nextPageToken) break;
+      pageToken = body.nextPageToken;
+    }
+  } else {
+    return { success: false, message: `${provider} does not use an API key.`, models: [] };
+  }
+
+  return {
+    success: true,
+    message: `API key is valid. ${models.length} ${provider} model${models.length === 1 ? '' : 's'} available.`,
+    models,
+  };
+}
 
 const DEFAULT_CONFIG: ConfigResponse = {
   model_provider: 'AWS Bedrock',
@@ -138,7 +330,7 @@ configRouter.get('/config/providers', (_req: Request, res: Response) => {
 });
 
 /** POST /config/test — validate a provider configuration. */
-configRouter.post('/config/test', (req: Request, res: Response) => {
+configRouter.post('/config/test', async (req: Request, res: Response) => {
   const parsed = ConfigTestRequestSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(422).json({ detail: parsed.error.issues });
@@ -175,19 +367,100 @@ configRouter.post('/config/test', (req: Request, res: Response) => {
     return;
   }
 
-  // API-key providers — confirm a key looks present.
-  if (request.api_key) {
+  // API-key providers: use the key typed in the form, else the one the server
+  // already holds (browser-supplied or from its launch environment), and make
+  // a real call to the provider with it.
+  const envVar = PROVIDER_ENV_VAR[request.provider];
+  const apiKey = request.api_key?.trim() || (envVar ? process.env[envVar] : undefined);
+  if (!apiKey) {
     res.json({
-      success: true,
-      message: `API key configured for ${request.provider}. Key will be validated on first use.`,
+      success: false,
+      message:
+        `${request.provider} requires an API key. Paste one into the API key field` +
+        (envVar ? `, or set ${envVar} before starting the server.` : '.'),
     });
     return;
   }
 
-  res.json({
-    success: false,
-    message: `${request.provider} requires an API key. Please provide one.`,
-  });
+  res.json(await probeProvider(request.provider, request.model_id, apiKey));
+});
+
+/**
+ * POST /config/provider-models — list the models an API key can call. POST,
+ * not GET, so a key typed in the form travels in the body rather than a URL.
+ * With no key in the body, the key the server already holds is used.
+ */
+configRouter.post('/config/provider-models', async (req: Request, res: Response) => {
+  const parsed = ProviderModelsRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({ detail: parsed.error.issues });
+    return;
+  }
+  const { provider, api_key } = parsed.data;
+  const envVar = PROVIDER_ENV_VAR[provider];
+  if (!envVar) {
+    const body: ProviderModelsResponse = {
+      success: false,
+      message: `${provider} does not use an API key.`,
+      models: [],
+    };
+    res.json(body);
+    return;
+  }
+  const apiKey = api_key?.trim() || process.env[envVar];
+  if (!apiKey) {
+    const body: ProviderModelsResponse = {
+      success: false,
+      message: `${provider} requires an API key. Paste one into the API key field, or set ${envVar} before starting the server.`,
+      models: [],
+    };
+    res.json(body);
+    return;
+  }
+  const body: ProviderModelsResponse = await listProviderModels(provider, apiKey);
+  res.json(body);
+});
+
+/** POST /config/api-key — set (or clear) a provider key held in memory only. */
+configRouter.post('/config/api-key', (req: Request, res: Response) => {
+  const parsed = ApiKeySetRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({ detail: parsed.error.issues });
+    return;
+  }
+  const { provider, api_key } = parsed.data;
+  const envVar = PROVIDER_ENV_VAR[provider];
+  if (!envVar) {
+    res.json({ success: false, message: `${provider} does not use an API key.` });
+    return;
+  }
+
+  const key = api_key?.trim();
+  if (key) {
+    process.env[envVar] = key;
+    browserKeyVars.add(envVar);
+    res.json({ success: true, message: `${provider} API key set for this server session.` });
+    return;
+  }
+
+  const launch = LAUNCH_ENV[envVar];
+  if (launch === undefined) delete process.env[envVar];
+  else process.env[envVar] = launch;
+  browserKeyVars.delete(envVar);
+  res.json({ success: true, message: `${provider} API key cleared.` });
+});
+
+/** GET /config/api-key-status?provider=… — whether a key is set (never the key). */
+configRouter.get('/config/api-key-status', (req: Request, res: Response) => {
+  const provider = typeof req.query.provider === 'string' ? req.query.provider : '';
+  const envVar = PROVIDER_ENV_VAR[provider] ?? null;
+  const configured = envVar ? Boolean(process.env[envVar]) : false;
+  const body: ApiKeyStatusResponse = {
+    configured,
+    source: !envVar || !configured ? null : browserKeyVars.has(envVar) ? 'browser' : 'environment',
+    env_var: envVar,
+  };
+  res.json(body);
 });
 
 /** POST /config/save — persist provider config to `.threatforest/config.yaml`. */

@@ -11,6 +11,7 @@
  */
 
 import type {
+  ApiKeyStatusResponse,
   Application,
   ApplicationSummary,
   ConfigResponse,
@@ -22,6 +23,7 @@ import type {
   LangfuseConfigSaveRequest,
   MitigationOverride,
   MitigationStatusT,
+  ProviderModelsResponse,
   ProvidersResponse,
   BedrockModelsResponse,
   ResumeResponse,
@@ -364,6 +366,40 @@ export async function testConnection(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(config),
   });
+}
+
+/** POST /api/config/api-key → hand the server a key it keeps in memory (null clears it). */
+export async function setApiKey(
+  provider: string,
+  apiKey: string | null,
+): Promise<ConfigTestResponse> {
+  return request<ConfigTestResponse>('/api/config/api-key', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, api_key: apiKey }),
+  });
+}
+
+/**
+ * POST /api/config/provider-models → the models an API key can call. With
+ * `apiKey` null, the server uses the key it already holds.
+ */
+export async function getProviderModels(
+  provider: string,
+  apiKey: string | null,
+): Promise<ProviderModelsResponse> {
+  return request<ProviderModelsResponse>('/api/config/provider-models', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, api_key: apiKey }),
+  });
+}
+
+/** GET /api/config/api-key-status → whether the server holds a key, and from where. */
+export async function getApiKeyStatus(provider: string): Promise<ApiKeyStatusResponse> {
+  return request<ApiKeyStatusResponse>(
+    `/api/config/api-key-status?provider=${encodeURIComponent(provider)}`,
+  );
 }
 
 /** POST /api/config/save → { success, message } */
