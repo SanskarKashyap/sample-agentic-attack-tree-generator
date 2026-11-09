@@ -18,8 +18,11 @@
     "test": "node --import tsx/esm --test \"src/**/*.test.ts\""
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.109.1",
+    "@google/genai": "^2.32.0",
     "@strands-agents/sdk": "^1.9.0",
     "@threatforest/types": "*",
+    "openai": "^6.49.0",
     "yaml": "^2.8.3",
     "zod": "^4.1.12"
   },

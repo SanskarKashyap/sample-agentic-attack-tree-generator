@@ -22,6 +22,15 @@ const API_TARGET = process.env.THREATFOREST_API_TARGET || 'http://localhost:8000
 const nextConfig = {
   output: process.env.NODE_ENV === 'production' ? 'export' : undefined,
   reactStrictMode: true,
+  // `next dev` rewrites proxy plain HTTP but not WebSocket upgrades, so the run
+  // progress socket could never connect through :3000 and every run page
+  // showed only "WebSocket error occurred." In dev the browser connects to the
+  // backend directly instead (see connectRunWebSocket). Empty in the static
+  // export, where the TS server hosts the UI and same-origin is correct.
+  env: {
+    THREATFOREST_WS_TARGET:
+      process.env.NODE_ENV === 'production' ? '' : API_TARGET.replace(/^http/, 'ws'),
+  },
   // Static export emits per-route folders (trailingSlash makes /foo -> /foo/index.html),
   // which is friendlier to plain static file servers.
   trailingSlash: true,

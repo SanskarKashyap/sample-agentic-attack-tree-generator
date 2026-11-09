@@ -582,7 +582,10 @@ export function connectRunWebSocket(
 
   function connect(): void {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${window.location.host}/ws/runs/${encodeURIComponent(runId)}`;
+    // Set only under `next dev` (next.config.mjs), whose proxy cannot carry
+    // WebSockets; otherwise the UI is served by the backend itself.
+    const base = process.env.THREATFOREST_WS_TARGET || `${protocol}//${window.location.host}`;
+    const url = `${base}/ws/runs/${encodeURIComponent(runId)}`;
     ws = new WebSocket(url);
 
     ws.addEventListener('open', (e) => {
